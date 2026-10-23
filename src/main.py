@@ -16,6 +16,13 @@ import atexit
 import functools
 from time import time, sleep
 
+try:
+    import tkinter as tk
+    from tkinter import simpledialog
+except Exception:
+    tk = None
+    simpledialog = None
+
 import stockfish
 import chess
 
@@ -123,7 +130,7 @@ class C:
     xpath_btn_choose_game_type='//button[contains(@class,"cc-dropdown-button-full")]/span[contains(@class, "cc-icon-glyph")]'
     xpath_btn_game_type_selection='//button[contains(@class, "cc-button-secondary")]/span[contains(text(), "%s")]'
     xpath_btn_start_game='//button[contains(@class, "cc-button-primary")]/span[contains(text(), "Start")]'
-    xpath_btn_control_game_type_selection='//button[contains(@class,"cc-dropdown-button-full") and contains(text(), "%s"))]'
+    xpath_btn_control_game_type_selection='//button[contains(@class,"cc-dropdown-button-full") and contains(text(), "%s")]'
 
     game_type_selections={
         "1min": "1 min",
@@ -196,7 +203,7 @@ if not os.path.exists(stockfish_path) and os.path.exists(stockfish_path + ".exe"
 Log.info(stockfish_path)
 if not os.path.exists(stockfish_path):
     Log.info("Consider copying the Stockfish binaries to "
-             "the ./stockfish directory of the project path.")
+              "the ./stockfish directory of the project path.")
     Log.info("The Stockfish binary name must be exactly \"stockfish\", the file's extension removed.")
     try:
         os.mkdir(stockfish_dir)
@@ -245,7 +252,7 @@ def setup_driver():
     options.add_argument("--accept-lang=en-US")
     
     if is_docker():
-        options.add_argument("--disable-dev-shm-usage") # important in Docker/Linux
+        options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--single-process")
         options.add_argument("--start-maximized")
         host = os.environ["hub_host"]
@@ -419,6 +426,7 @@ def controls_visible(driver):
     except selenium.common.exceptions.StaleElementReferenceException:
         return False
 
+
 def get_fen_deriv(fen: str, move_uci: str) -> str:
     board = chess.Board(fen)
     move = chess.Move.from_uci(move_uci)
@@ -427,36 +435,176 @@ def get_fen_deriv(fen: str, move_uci: str) -> str:
     print("FEN: ",out)
     return out
 
+
+def prompt_for_credentials():
+    email = os.environ.get("CHESS_EMAIL") or os.environ.get("EMAIL") or os.environ.get("CHESS_USERNAME")
+    password = os.environ.get("CHESS_PASSWORD") or os.environ.get("PASSWORD")
+
+    if email and password:
+        return email, password
+
+    if tk is not None and simpledialog is not None:
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            email = simpledialog.askstring("Chess.com Login", "Enter your Chess.com email or username:")
+            password = simpledialog.askstring("Chess.com Login", "Enter your Chess.com password:", show="*")
+            if email and password:
+                return email, password
+        finally:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+
+    raise RuntimeError(
+        "No Chess.com credentials were supplied. Set CHESS_EMAIL and CHESS_PASSWORD "
+        "or provide them through the first-run login window."
+    )
+
+
+def login_to_chess_com(driver: webdriver.Chrome, email: str, password: str):
+    driver.get("https://www.chess.com/login")
+    wait = WebDriverWait(driver, 20)
+
+    try:
+        wait.until(EC.any_of(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email']")),
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='username']")),
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='email']")),
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='password']")),
+        ))
+    except selenium.common.exceptions.TimeoutException:
+        Log.warning("Chess.com login form did not appear; using existing session state if available.")
+        return
+
+    for cookie_selector in [
+        "//button[contains(., 'Accept all')]",
+        "//button[contains(., 'Accept')]",
+        "//button[contains(., 'Continue')]",
+    ]:
+        try:
+            cookie_button = driver.find_element(By.XPATH, cookie_selector)
+            if cookie_button.is_displayed():
+                cookie_button.click()
+                sleep(0.5)
+        except Exception:
+            pass
+
+    for email_selector in [
+        "input[type='email']",
+        "input[name='email']",
+        "input[name='username']",
+    ]:
+        try:
+            email_field = driver.find_element(By.CSS_SELECTOR, email_selector)
+            email_field.clear()
+            email_field.send_keys(email)
+            break
+        except Exception:
+            pass
+
+    for password_selector in [
+        "input[type='password']",
+        "input[name='password']",
+    ]:
+        try:
+            pwd_field = driver.find_element(By.CSS_SELECTOR, password_selector)
+            pwd_field.clear()
+            pwd_field.send_keys(password)
+            break
+        except Exception:
+            pass
+
+    try:
+        submit_button = driver.find_element(By.XPATH, "//button[@type='submit' or contains(., 'Log In') or contains(., 'Continue') or contains(., 'Sign In')]")
+        submit_button.click()
+    except Exception:
+        try:
+            driver.execute_script("document.querySelector('button[type="submit"]').click();")
+        except Exception:
+            pass
+
+    try:
+        wait.until(lambda drv: "login" not in drv.current_url.lower() and "register" not in drv.current_url.lower())
+    except selenium.common.exceptions.TimeoutException:
+        pass
+    sleep(2)
+
+
+def accept_pending_challenge_if_any(driver: webdriver.Chrome):
+    challenge_selectors = [
+        "//button[contains(translate(normalize-space(string(.)), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept challenge')]",
+        "//button[contains(translate(normalize-space(string(.)), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]",
+        "//button[contains(translate(normalize-space(string(.)), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'play now')]",
+        "//*[contains(translate(normalize-space(string(.)), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'challenge') and contains(translate(normalize-space(string(.)), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]",
+    ]
+
+    for selector in challenge_selectors:
+        try:
+            buttons = driver.find_elements(By.XPATH, selector)
+            for btn in buttons:
+                text = (btn.text or "").lower()
+                if not text:
+                    continue
+                if any(token in text for token in ["accept", "play now", "play", "challenge"]) and any(token in text for token in ["10", "10m", "10 min", "challenge"]):
+                    btn.click()
+                    Log.info("Accepted a pending Chess.com challenge.")
+                    return True
+        except Exception:
+            pass
+
+    return False
+
+
 def get_next_move(engine: stockfish.Stockfish):
     global PREVIOUS_FEN_POSITIONS
-    
-    mv = engine.get_best_move()
+
     current_fen = engine.get_fen_position()
-    fen_deriv = get_fen_deriv(current_fen, mv)
+    board = chess.Board(current_fen)
+    legal_moves = list(board.legal_moves)
+    if not legal_moves:
+        return None
 
-    if PREVIOUS_FEN_POSITIONS[fen_deriv]<2:
-        PREVIOUS_FEN_POSITIONS[fen_deriv]+=1
-        return mv
-    
-    Log.debug(f"Best move {mv} will cause a draw. Choosing another move")
-    found = False
-    
-    top_moves = [x["Move"] for x in engine.get_top_moves(5)]
-    print(top_moves)
+    best_move = None
+    best_eval = None
 
-    for i, mv in enumerate(top_moves):
-        fen_deriv = get_fen_deriv(current_fen, mv)
-        if PREVIOUS_FEN_POSITIONS[fen_deriv]<2:
-            found = True
-            break
-        
-    if not found:
-        mv = top_moves[0]
-        fen_deriv = get_fen_deriv(current_fen, mv)
-        Log.error(f"No move was found to prevent a draw. Playing {mv}")
-    
-    PREVIOUS_FEN_POSITIONS[fen_deriv]+=1
-    return mv
+    for move in legal_moves:
+        board_after = board.copy()
+        board_after.push(move)
+        engine.set_fen_position(board_after.fen())
+
+        evaluation = engine.get_evaluation()
+        score = 0
+        if isinstance(evaluation, dict):
+            score = evaluation.get("value", 0)
+            if evaluation.get("type") == "mate":
+                score = 100000 if score > 0 else -100000
+        abs_score = abs(score)
+
+        if best_eval is None or abs_score < best_eval:
+            best_eval = abs_score
+            best_move = move.uci()
+
+    engine.set_fen_position(current_fen)
+    if best_move is None:
+        return engine.get_best_move()
+
+    fen_deriv = get_fen_deriv(current_fen, best_move)
+    if PREVIOUS_FEN_POSITIONS[fen_deriv] < 2:
+        PREVIOUS_FEN_POSITIONS[fen_deriv] += 1
+        return best_move
+
+    for move in legal_moves:
+        candidate = move.uci()
+        fen_deriv = get_fen_deriv(current_fen, candidate)
+        if PREVIOUS_FEN_POSITIONS[fen_deriv] < 2:
+            PREVIOUS_FEN_POSITIONS[fen_deriv] += 1
+            return candidate
+
+    PREVIOUS_FEN_POSITIONS[fen_deriv] += 1
+    return best_move
+
 
 @trace_exec_time
 async def play(driver: webdriver.Chrome, engine: stockfish.Stockfish, move):
@@ -494,12 +642,10 @@ async def actions(engine: stockfish.Stockfish, driver_: webdriver.Chrome):
         engine.set_elo_rating(elo_rating_)
 
     try:
-        #Log.info("Waiting for a \"board\" element")
         await wait_until(driver_, C.wait_50ms, min_n_elements_exist(
             by=By.CLASS_NAME,
             selector=C.board
         ))
-        #Log.info("Waiting for the game to start")
         await wait_until(driver_, C.wait_50ms, min_n_elements_exist(
             by=By.XPATH,
             selector=C.controls_xpath,
@@ -551,9 +697,7 @@ async def actions(engine: stockfish.Stockfish, driver_: webdriver.Chrome):
         try:
             engine.make_moves_from_current_position([mv])
         except:
-            # an exception commonly occurs if opponent promotes a piece.
-            # by default it is assumed that a queen was promoted
-            mv+="q"
+            mv += "q"
             engine.make_moves_from_current_position([mv])
         Log.info("Opponent's move: %s", mv)
         return False
@@ -636,7 +780,6 @@ class PreGameStartHandlers:
         try:
             sidemenu_play = wait.until(EC.element_to_be_clickable((By.XPATH, C.link_play)))
             actions = ActionChains(driver)
-            # Perform hover
             actions.move_to_element(sidemenu_play).perform()
             await asyncio.sleep(0.5)
         except selenium.common.exceptions.TimeoutException:
@@ -701,9 +844,6 @@ class PreGameStartHandlers:
             pass
         
         if time()-NEW_GAME_BUTTON_CLICK_TIME>NEW_GAME_BUTTON_CLICK_TIMEOUT:
-            # Sometimes, the "New Game" button does not start a new game 
-            # possibly due to a chess.com server related matchmaking bug or network issues.
-            # The driver will be refreshed in such cases
             driver.refresh()
             _gamemode_selected = False
             NEW_GAME_BUTTON_CLICK_TIME=time()
@@ -711,7 +851,10 @@ class PreGameStartHandlers:
 
 async def main_():
     global url, autostart_, _gamemode_selected
+
+    email, password = prompt_for_credentials()
     driver = setup_driver()
+    login_to_chess_com(driver, email, password)
     engine = stockfish.Stockfish(path=os.path.join(os.getcwd(), stockfish_path))
 
     async def stop_event_loop():
@@ -761,6 +904,7 @@ async def main_():
     wait_ = WebDriverWait(driver, 0.1)
     while await loop():
         driver_url = driver.current_url
+        accept_pending_challenge_if_any(driver)
         if next_game_auto_ and "computer" not in driver_url:
             await PreGameStartHandlers.handle_menu_buttons(driver, wait_)
         if autostart_ and not any(x in driver_url for x in ["play/online", "game"]):
@@ -802,7 +946,6 @@ def main(elo_rating: str,
     def to_bool(value: str) -> bool:
         return str(value).strip().lower() in {"1", "true", "t", "yes", "y"}
 
-    # centralized normalization
     global url, autostart_, game_timer, first_move_for_white
     global current_game_type, move_delay, elo_rating_, next_game_auto_
 
